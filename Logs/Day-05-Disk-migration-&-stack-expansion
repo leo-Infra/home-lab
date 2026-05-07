@@ -1,0 +1,188 @@
+# Day 05 - Disk Migration and Stack Expansion
+
+## Objective
+
+Replace the small 250 GB system disk with a 6 TB NAS-grade drive without losing any data or breaking the running Docker stack, then extend the filesystem to use the full capacity and add new services to the stack.
+
+## What I did
+
+### Hardware upgrade
+
+**Old disk**: Seagate ST250DM000 (250 GB, 7200 RPM)
+**New disk**: Western Digital WD Red Pro WD6005FFBX (6 TB, 7200 RPM, CMR, NAS-grade)
+
+Bought the drive from Europ Computer Performance for 240€ TTC.
+
+### Pre-migration backup
+
+Saved critical config files to a separate machine before touching anything:
+
+```bash
+mkdir -p ~/backup-pre-clone-$(date +%Y%m%d)
+cd ~/backup-pre-clone-$(date +%Y%m%d)
+sudo cp /etc/fstab .
+sudo find / \( -name "docker-compose.yml" -o -name ".env" \) -exec cp --parents {} . \; 2>/dev/null
+sudo lsblk -f > lsblk.txt
+sudo blkid > blkid.txt
+```
+
+Then `scp` to my laptop as a safety net.
+
+### Disk cloning with dd
+
+Decided to go with a direct `dd` clone rather than booting on Clonezilla USB. Simpler workflow when both disks can be plugged in at the same time.
+
+Stopped the Docker stack first to avoid corrupting databases:
+
+```bash
+cd ~/docker/arr-stack
+sudo docker compose down
+```
+
+Identified disks:
+
+```bash
+lsblk -d -o NAME,SIZE,MODEL
+# sda  232.9G  ST250DM000-1BD14   (source)
+# sdb  5.5T    WDC WD6005FFBX-6   (destination)
+```
+
+Launched the clone:
+
+```bash
+sudo dd if=/dev/sda of=/dev/sdb bs=64K conv=noerror,sync status=progress
+```
+
+**Result**: ~30 minutes to clone 232 GB at an average of 132 MB/s. No errors.
+
+### Physical swap
+
+Powered off, unplugged the old Seagate (kept it in the case as a fallback), left the new WD plugged in.
+
+### Boot issue: BIOS error 1962
+
+**Problem encountered**: machine wouldn't boot, repeating beep pattern, then `Error 1962: No operating system found, boot sequence will automatically repeat`.
+
+**Diagnosis**: in the Lenovo BIOS, I found the new disk was detected as `eSATA: WDC WD6005FFBX` and was sitting in the **"Excluded from boot order"** section. The BIOS refused to consider it a bootable device.
+
+**Fix**: in BIOS → Startup → Primary Boot Sequence:
+
+1. Selected the eSATA entry
+2. Pressed `X` to include it in the boot order
+3. Used `+/-` to move it to first position
+4. F10 to save
+
+System booted into Ubuntu 24.04 LTS on the first try after that.
+
+### Filesystem expansion (LVM)
+
+After clone, the partition table on the new disk was still 232 GB — I had ~5.3 TB of unallocated space to recover. Since Ubuntu uses LVM, this is a 4-step process:
+
+```bash
+# 1. Extend the partition
+sudo parted /dev/sda resizepart 3 100%
+
+# 2. Resize the LVM Physical Volume
+sudo pvresize /dev/sda3
+
+# 3. Extend the Logical Volume to use all free space
+sudo lvextend -l +100%FREE /dev/ubuntu-vg/ubuntu-lv
+
+# 4. Resize the ext4 filesystem
+sudo resize2fs /dev/ubuntu-vg/ubuntu-lv
+```
+
+**Result**: root partition went from 98 GB to 5.4 TiB, with 5.1 TiB free. All done live, no reboot, no service interruption.
+
+### SMART check on the new drive
+
+```bash
+sudo smartctl -a /dev/sda | grep -E "SMART overall-health|Reallocated"
+```
+
+Output:
+```
+SMART overall-health self-assessment test result: PASSED
+Reallocated_Sector_Ct: 0
+Reallocated_Event_Count: 0
+```
+
+Brand new drive in perfect health.
+
+### Docker stack recovery
+
+Thanks to `restart: unless-stopped` on every service in the compose file, **all 13 containers came back up automatically** after the boot on the new disk. Zero manual intervention needed.
+
+Verified all services were healthy:
+
+```bash
+sudo docker ps
+```
+
+All containers reported `Up` or `Up healthy`. Jellyfin, Sonarr, Radarr, qBittorrent, Gluetun (VPN), Prowlarr — everything was alive and reachable on its port.
+
+Tested the full pipeline by checking Radarr's history: movies that had been queued before the migration completed downloading during the night following the swap.
+
+### Stack expansion
+
+Added two new services to the existing `docker-compose.yml`:
+
+- **A new content manager** (similar pattern to Radarr, but routed through Gluetun like Prowlarr — same `network_mode: service:gluetun`)
+- **A new dedicated media server** (separate from Jellyfin, in the `arrnetwork` Docker network)
+
+Created a separate storage path `/data/media-adult/` to keep this content fully decoupled from the Jellyfin library at `/data/media/`.
+
+```bash
+sudo mkdir -p /data/media-adult/movies
+sudo chown -R 1000:1000 /data/media-adult
+```
+
+Updated the `.env` file with a new reserved IP for the new media server, and added the necessary port mapping on Gluetun for the new manager's WebUI (port 6969).
+
+**YAML gotcha**: hit a syntax error during `docker compose config`:
+```
+yaml: while parsing a block mapping at line 277: did not find expected key
+```
+
+Turned out I had accidentally uncommented the Jellyfin `devices: /dev/dri:/dev/dri` block in nano while editing. Re-commented those lines and the compose validated cleanly.
+
+After `docker compose up -d`, the final stack count went from 13 to 15 containers, all running.
+
+## What I learned
+
+- **`dd` is a perfectly fine cloning tool** for a homelab as long as you stop your services first (consistent state) and double-check the `if=` and `of=` arguments. No need for fancy ISOs when both disks fit in the box.
+- **`restart: unless-stopped` is gold** — it turned what could have been a stressful "now I have to manually start everything in the right order" moment into a non-event.
+- **LVM is worth the extra abstraction**. Live filesystem extension across 5.3 TiB without unmounting `/` is genuinely magic compared to old-school partition resizing.
+- **BIOS quirks are real**: a disk plugged into a port the BIOS labels as `eSATA` won't be in the boot order by default, even if physically it's just an internal SATA connection. Always check both the boot mode (UEFI vs Legacy) AND the boot order before assuming the clone failed.
+- **YAML is unforgiving**: indentation matters, and a misplaced `#` in a comment block can break the entire compose file. `docker compose config` is the fastest way to validate syntax before a `up -d`.
+- The `Power_On_Hours` SMART attribute on a new drive should be very low (under 50). Worth checking on any "new" drive — refurbished units sometimes get sold as new.
+
+## Issues encountered
+
+**BIOS error 1962 on first boot**:
+- Resolved by including the eSATA-detected disk in the BIOS boot sequence (key `X`).
+
+**YAML syntax error after editing compose file in nano**:
+- Accidentally uncommented Jellyfin's `devices` block. Re-commented to fix.
+
+**Lenovo BIOS quirk**: the SATA controller on this ThinkCentre M83 sometimes labels an internal SATA port as `eSATA` in the BIOS, which excludes the disk from the boot order by default.
+
+## Next steps
+
+- [ ] Reroute the new disk to a non-eSATA SATA port for cleanliness (cosmetic, not blocking)
+- [ ] Upgrade RAM from 8 GB to 16 GB (DDR3-1600 UDIMM kit, ~60€)
+- [ ] Consider CPU upgrade to i5-4590 or i7-4790 (~20-25€ used) for better Jellyfin transcoding performance
+- [ ] Set up automated weekly SMART self-tests with `smartd` and email alerts
+- [ ] Set up a reverse proxy (Caddy or Nginx Proxy Manager) to access services via subdomains instead of `host:port`
+- [ ] Keep the old Seagate physically present but unplugged for ~2 weeks as a rollback safety net before final removal
+- [ ] Install Homepage dashboard for a single landing page over the whole stack (carried over from Day 06 backlog)
+- [ ] Enable VAAPI hardware acceleration in Jellyfin (still pending from Day 06)
+
+## Final state
+
+- **OS**: Ubuntu 24.04.4 LTS
+- **Hardware**: Lenovo ThinkCentre M83 Tower, Pentium G3220, 8 GB DDR3
+- **Storage**: 5.4 TiB total, 5.1 TiB free on `/`
+- **Containers running**: 15
+- **VPN**: Gluetun healthy, all routed services protected
+- **Local IP**: 192.168.1.76
